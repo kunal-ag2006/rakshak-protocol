@@ -1,0 +1,1080 @@
+"""
+Rakshak Protocol - Tactical Cyber-Command Center & API Server
+Author: TransparentGov Core Engineering // Kunal
+License: MIT
+"""
+
+import asyncio
+from dataclasses import asdict
+import json
+import os
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+
+from server.app.config import settings
+from server.app.drone_router import Coordinates, drone_router
+from server.app.evidence_vault import evidence_vault
+from server.app.models import IncidentSummary, TelemetryFrame, ThreatSeverity, dump_model
+from server.app.mqtt_broker import incident_manager
+
+app = FastAPI(
+    title="Rakshak Protocol",
+    version="1.0.0",
+    description="Zero-Click Emergency SOS, Autonomous Drone Dispatch, and Evidence Vault"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Active WebSocket connections for live HUD sessions
+active_connections: List[WebSocket] = []
+
+
+def ws_broadcast_handler(event_payload: Dict[str, Any]):
+    """Push real-time updates to all active operator consoles."""
+    dead_sockets = []
+    message = json.dumps(event_payload)
+    for ws in list(active_connections):
+        try:
+            asyncio.create_task(ws.send_text(message))
+        except Exception:
+            dead_sockets.append(ws)
+
+    for dead in dead_sockets:
+        if dead in active_connections:
+            active_connections.remove(dead)
+
+
+incident_manager.register_broadcast_listener(ws_broadcast_handler)
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "HEALTHY", "service": "rakshak-protocol-engine", "version": "1.0.0"}
+
+
+@app.get(f"{settings.API_PREFIX}/incidents", response_model=List[IncidentSummary])
+def get_all_incidents():
+    return list(incident_manager.active_incidents.values())
+
+
+@app.get(f"{settings.API_PREFIX}/incidents/{{incident_id}}")
+def get_incident_details(incident_id: str):
+    if incident_id not in incident_manager.active_incidents:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+    incident = incident_manager.active_incidents[incident_id]
+    telemetry_stream = incident_manager.telemetry_history.get(incident_id, [])
+    drone = drone_router.drones_telemetry.get(incident.assigned_drone_id) if incident.assigned_drone_id else None
+    verified, msg = evidence_vault.verify_chain_integrity(incident_id)
+
+    return {
+        "incident": dump_model(incident),
+        "telemetry_stream": [dump_model(t) for t in telemetry_stream],
+        "assigned_drone": dump_model(drone) if drone else None,
+        "evidence_chain_length": len(evidence_vault.get_chain(incident_id)),
+        "evidence_integrity_verified": verified,
+        "evidence_verification_report": msg,
+    }
+
+
+@app.get(f"{settings.API_PREFIX}/incidents/{{incident_id}}/evidence-ledger")
+def get_evidence_ledger(incident_id: str):
+    chain = evidence_vault.get_chain(incident_id)
+    is_valid, report = evidence_vault.verify_chain_integrity(incident_id)
+    return {
+        "incident_id": incident_id,
+        "block_count": len(chain),
+        "chain_integrity_valid": is_valid,
+        "audit_report": report,
+        "blocks": [dump_model(b) for b in chain],
+    }
+
+
+@app.get(f"{settings.API_PREFIX}/drones/stations")
+def list_drone_stations():
+    return {
+        "stations": [dump_model(s) for s in drone_router.stations.values()],
+        "drones": [dump_model(d) for d in drone_router.drones_telemetry.values()],
+    }
+
+
+@app.post(f"{settings.API_PREFIX}/sos/trigger")
+def trigger_sos_manually(frame: TelemetryFrame):
+    result = incident_manager.ingest_telemetry_frame(frame)
+    return result
+
+
+@app.post(f"{settings.API_PREFIX}/drone/step")
+def step_drone_simulation(drone_id: str, dt_seconds: float = 1.0):
+    updated = drone_router.simulate_drone_step(drone_id, dt_seconds)
+    if updated:
+        incident_manager.broadcast_event("DRONE_TELEMETRY_UPDATE", dump_model(updated))
+        return dump_model(updated)
+    raise HTTPException(status_code=404, detail="Drone not found")
+
+
+@app.websocket("/ws/emergency-feed")
+async def websocket_emergency_feed(websocket: WebSocket):
+    await websocket.accept()
+    active_connections.append(websocket)
+    try:
+        snapshot = {
+            "event": "INITIAL_STATE",
+            "incidents": [dump_model(i) for i in incident_manager.active_incidents.values()],
+            "drones": [dump_model(d) for d in drone_router.drones_telemetry.values()],
+            "stations": [dump_model(s) for s in drone_router.stations.values()],
+        }
+        await websocket.send_text(json.dumps(snapshot))
+
+        while True:
+            data = await websocket.receive_text()
+            try:
+                cmd = json.loads(data)
+                if cmd.get("action") == "PING":
+                    await websocket.send_text(json.dumps({"event": "PONG", "timestamp": time.time()}))
+            except Exception:
+                pass
+    except WebSocketDisconnect:
+        if websocket in active_connections:
+            active_connections.remove(websocket)
+
+
+EMBEDDED_HTML_DASHBOARD = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RAKSHAK // TACTICAL CYBER-COMMAND HUD v3.0</title>
+    <!-- Anime.js CDN -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/animejs/3.2.2/anime.min.js"></script>
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;800;900&family=Rajdhani:wght@500;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-void: #020408;
+            --bg-glass: rgba(6, 12, 22, 0.75);
+            --border-neon-cyan: rgba(0, 240, 255, 0.35);
+            --border-neon-red: rgba(255, 0, 85, 0.5);
+            --cyan-glow: #00f0ff;
+            --red-alert: #ff0055;
+            --amber-warn: #ffaa00;
+            --green-active: #00ff88;
+            --text-dim: #71829d;
+            --text-bright: #e2f1ff;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
+        
+        body {
+            background-color: var(--bg-void);
+            background-image: 
+                radial-gradient(circle at 50% 50%, rgba(0, 240, 255, 0.03) 0%, transparent 80%),
+                linear-gradient(rgba(0, 240, 255, 0.02) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(0, 240, 255, 0.02) 1px, transparent 1px);
+            background-size: 100% 100%, 30px 30px, 30px 30px;
+            color: var(--text-bright);
+            font-family: 'Rajdhani', sans-serif;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow-x: hidden;
+        }
+
+        /* Scanline Overlay */
+        body::before {
+            content: " ";
+            position: fixed;
+            top: 0; left: 0; bottom: 0; right: 0;
+            background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.03), rgba(0, 255, 0, 0.01), rgba(0, 0, 255, 0.03));
+            background-size: 100% 3px, 6px 100%;
+            pointer-events: none;
+            z-index: 999;
+            opacity: 0.6;
+        }
+
+        /* Futuristic Header */
+        header {
+            background: rgba(3, 7, 14, 0.85);
+            backdrop-filter: blur(16px);
+            border-bottom: 1px solid var(--border-neon-cyan);
+            padding: 10px 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            box-shadow: 0 4px 25px rgba(0, 240, 255, 0.1);
+        }
+
+        .hud-logo {
+            font-family: 'Orbitron', sans-serif;
+            font-weight: 900;
+            font-size: 1.3rem;
+            letter-spacing: 3px;
+            color: #fff;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            text-shadow: 0 0 15px var(--cyan-glow);
+        }
+
+        .hud-status-tag {
+            font-family: 'Orbitron', monospace;
+            font-size: 0.75rem;
+            padding: 4px 10px;
+            border-radius: 2px;
+            font-weight: 700;
+            letter-spacing: 1px;
+            border: 1px solid var(--cyan-glow);
+            background: rgba(0, 240, 255, 0.1);
+            color: var(--cyan-glow);
+            box-shadow: 0 0 10px rgba(0, 240, 255, 0.2);
+            transition: all 0.3s;
+        }
+
+        /* Signal Telemetry Ticker */
+        .telemetry-ticker {
+            background: #040810;
+            border-bottom: 1px solid rgba(0, 240, 255, 0.15);
+            padding: 6px 24px;
+            display: flex;
+            gap: 28px;
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 0.76rem;
+            color: var(--text-dim);
+            text-transform: uppercase;
+        }
+        .ticker-item { display: flex; align-items: center; gap: 8px; }
+        .ticker-val { color: var(--cyan-glow); font-weight: bold; }
+        .pulse-light {
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            background: var(--green-active);
+            box-shadow: 0 0 10px var(--green-active);
+            display: inline-block;
+        }
+        .pulse-light.alert {
+            background: var(--red-alert);
+            box-shadow: 0 0 14px var(--red-alert);
+            animation: redFlash 0.5s infinite alternate;
+        }
+        @keyframes redFlash { from { opacity: 0.3; transform: scale(0.8); } to { opacity: 1; transform: scale(1.2); } }
+
+        /* Main Futuristic Grid */
+        main {
+            display: grid;
+            grid-template-columns: 330px 1fr 340px;
+            gap: 16px;
+            padding: 16px;
+            flex: 1;
+        }
+
+        /* Glassmorphic Cyber Panels */
+        .cyber-panel {
+            background: var(--bg-glass);
+            border: 1px solid var(--border-neon-cyan);
+            border-radius: 6px;
+            padding: 14px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+            backdrop-filter: blur(12px);
+            position: relative;
+        }
+
+        /* Futuristic Corner Accents */
+        .cyber-panel::before {
+            content: '';
+            position: absolute;
+            top: -1px; left: -1px;
+            width: 10px; height: 10px;
+            border-top: 2px solid var(--cyan-glow);
+            border-left: 2px solid var(--cyan-glow);
+        }
+        .cyber-panel::after {
+            content: '';
+            position: absolute;
+            bottom: -1px; right: -1px;
+            width: 10px; height: 10px;
+            border-bottom: 2px solid var(--cyan-glow);
+            border-right: 2px solid var(--cyan-glow);
+        }
+
+        .panel-title {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 0.82rem;
+            font-weight: 700;
+            letter-spacing: 1.5px;
+            color: #94a3b8;
+            text-transform: uppercase;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid rgba(0, 240, 255, 0.15);
+            padding-bottom: 8px;
+        }
+
+        /* Metric Cards */
+        .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+        .stat-card {
+            background: rgba(11, 22, 38, 0.6);
+            border: 1px solid rgba(0, 240, 255, 0.2);
+            padding: 10px 12px;
+            border-radius: 4px;
+            position: relative;
+            overflow: hidden;
+            transition: all 0.3s;
+        }
+        .stat-card.danger {
+            border-color: var(--red-alert);
+            background: rgba(255, 0, 85, 0.1);
+            box-shadow: 0 0 15px rgba(255, 0, 85, 0.2);
+        }
+        .stat-label {
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 0.68rem;
+            color: var(--text-dim);
+            letter-spacing: 1px;
+        }
+        .stat-value {
+            font-family: 'Orbitron', monospace;
+            font-size: 1.35rem;
+            font-weight: 800;
+            color: #fff;
+            margin-top: 4px;
+        }
+
+        /* Center Canvas Tactical Viewport */
+        .tactical-viewport {
+            position: relative;
+            background: radial-gradient(circle at 50% 50%, #06111f 0%, #02060c 100%);
+            border: 1px solid var(--border-neon-cyan);
+            border-radius: 6px;
+            height: 380px;
+            overflow: hidden;
+            box-shadow: inset 0 0 50px rgba(0, 240, 255, 0.1);
+        }
+        #radarCanvas { width: 100%; height: 100%; display: block; }
+
+        .hud-crosshair {
+            position: absolute;
+            top: 12px; left: 12px;
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 0.72rem;
+            color: var(--cyan-glow);
+            line-height: 1.4;
+            pointer-events: none;
+            background: rgba(4, 9, 16, 0.7);
+            padding: 6px 10px;
+            border-left: 2px solid var(--cyan-glow);
+        }
+
+        /* Futuristic Neon Controls */
+        .btn-cyber {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 0.76rem;
+            font-weight: 800;
+            letter-spacing: 1.5px;
+            padding: 12px 16px;
+            border: 1px solid transparent;
+            border-radius: 3px;
+            cursor: pointer;
+            text-transform: uppercase;
+            transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            position: relative;
+            overflow: hidden;
+        }
+        .btn-cyber-red {
+            background: linear-gradient(135deg, #ff0055 0%, #a80038 100%);
+            color: #fff;
+            border-color: #ff3377;
+            box-shadow: 0 0 20px rgba(255, 0, 85, 0.4);
+        }
+        .btn-cyber-red:hover {
+            box-shadow: 0 0 30px rgba(255, 0, 85, 0.7);
+            transform: translateY(-2px);
+        }
+        .btn-cyber-cyan {
+            background: rgba(0, 240, 255, 0.1);
+            color: var(--cyan-glow);
+            border-color: var(--cyan-glow);
+            box-shadow: 0 0 15px rgba(0, 240, 255, 0.2);
+        }
+        .btn-cyber-cyan:hover {
+            background: var(--cyan-glow);
+            color: #000;
+            box-shadow: 0 0 25px var(--cyan-glow);
+            transform: translateY(-2px);
+        }
+        .btn-cyber-dark {
+            background: rgba(15, 23, 42, 0.8);
+            color: #94a3b8;
+            border-color: rgba(255, 255, 255, 0.1);
+        }
+        .btn-cyber-dark:hover {
+            color: #fff;
+            border-color: var(--cyan-glow);
+        }
+
+        /* Oscilloscopes */
+        .wave-box { width: 100%; height: 50px; background: #03070d; border: 1px solid rgba(0, 240, 255, 0.15); border-radius: 3px; }
+
+        /* Cryptographic Ledger Terminal */
+        .cyber-ledger {
+            background: #020509;
+            border: 1px solid rgba(0, 240, 255, 0.15);
+            border-radius: 4px;
+            padding: 10px;
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 0.72rem;
+            color: #38bdf8;
+            height: 250px;
+            overflow-y: auto;
+        }
+        .ledger-item { margin-bottom: 8px; border-bottom: 1px dashed rgba(56, 189, 248, 0.2); padding-bottom: 6px; }
+        .hash-str { color: var(--cyan-glow); word-break: break-all; }
+
+        footer {
+            background: #03060c;
+            border-top: 1px solid rgba(0, 240, 255, 0.15);
+            padding: 8px 24px;
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 0.72rem;
+            color: var(--text-dim);
+            display: flex;
+            justify-content: space-between;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="hud-logo">
+            <span>🛡️ RAKSHAK PROTOCOL</span>
+            <span style="font-size: 0.65rem; color: var(--cyan-glow); font-family: 'Share Tech Mono';">AUTONOMOUS CIVIC OS // MODULE 3</span>
+        </div>
+        <div style="display: flex; gap: 14px; align-items: center;">
+            <div id="hudSystemStatus" class="hud-status-tag">SYSTEM: ARMED & NOMINAL</div>
+            <div style="font-family: 'Share Tech Mono'; font-size: 0.8rem; color: var(--text-dim);" id="clockDisplay">00:00:00 UTC</div>
+        </div>
+    </header>
+
+    <div class="telemetry-ticker">
+        <div class="ticker-item"><span id="lightMqtt" class="pulse-light"></span> <span>TELEMETRY BUS:</span> <span class="ticker-val">MQTT TLS 1.3 // QoS 2</span></div>
+        <div class="ticker-item"><span id="lightBio" class="pulse-light"></span> <span>WEARABLE SENSORS:</span> <span class="ticker-val" id="tickerBio">PPG 35Hz DUAL-CHANNEL</span></div>
+        <div class="ticker-item"><span id="lightTinyML" class="pulse-light"></span> <span>TINYML INFERENCE:</span> <span class="ticker-val" id="tickerAcoustic">MFCC CONV1D ARMED</span></div>
+        <div class="ticker-item"><span class="pulse-light"></span> <span>DRONE FLEET:</span> <span class="ticker-val">4 CELL-TOWER DOCKS ONLINE</span></div>
+    </div>
+
+    <main>
+        <!-- LEFT PANEL: Citizen Biometrics & Neural Inference -->
+        <section class="cyber-panel" id="panelBiometrics">
+            <div class="panel-title">
+                <span>Citizen Biometrics (PPG/HRV)</span>
+                <span id="badgeBio" style="color: var(--green-active); font-size: 0.7rem; font-family: 'Orbitron';">NORMAL</span>
+            </div>
+
+            <div class="stat-grid">
+                <div class="stat-card" id="cardHR">
+                    <div class="stat-label">Heart Rate (HR)</div>
+                    <div class="stat-value"><span id="valHR">72</span> <span style="font-size: 0.75rem; color: var(--text-dim);">BPM</span></div>
+                </div>
+                <div class="stat-card" id="cardHRV">
+                    <div class="stat-label">HRV (RMSSD)</div>
+                    <div class="stat-value"><span id="valHRV">48.2</span> <span style="font-size: 0.75rem; color: var(--text-dim);">ms</span></div>
+                </div>
+            </div>
+
+            <div>
+                <div class="stat-label" style="margin-bottom: 4px;">Dynamic Electrocardiogram (ECG)</div>
+                <canvas id="ecgCanvas" class="wave-box"></canvas>
+            </div>
+
+            <div class="panel-title" style="margin-top: 6px;">
+                <span>On-Device TinyML Acoustic Guard</span>
+                <span id="badgeAcoustic" style="color: var(--cyan-glow); font-size: 0.7rem; font-family: 'Orbitron';">LISTENING</span>
+            </div>
+
+            <div class="stat-card" id="cardAcoustic">
+                <div class="stat-label">Neural Audio Classification</div>
+                <div class="stat-value" style="font-size: 1.05rem;" id="valAcoustic">AMBIENT_NORMAL</div>
+                <div class="stat-label" style="margin-top: 4px;">Confidence: <span id="valConf" style="color: var(--green-active); font-weight: bold;">94.8%</span></div>
+            </div>
+
+            <div>
+                <div class="stat-label" style="margin-bottom: 4px;">Real-Time Audio Spectrogram Envelope</div>
+                <canvas id="audioCanvas" class="wave-box"></canvas>
+            </div>
+
+            <div class="panel-title" style="margin-top: 6px;">
+                <span>Stealth SOS Status</span>
+            </div>
+            <div style="font-family: 'Share Tech Mono', monospace; font-size: 0.76rem; background: rgba(5, 11, 20, 0.8); border: 1px solid rgba(0, 240, 255, 0.15); padding: 8px; border-radius: 4px; display: flex; flex-direction: column; gap: 4px;">
+                <div>Display: <strong id="valScreen" style="color: var(--green-active);">NORMAL UNLOCKED</strong></div>
+                <div>Encrypted Uplink: <strong id="valUplink" style="color: var(--text-dim);">STANDBY (0 B/s)</strong></div>
+                <div>GPS Target: <strong style="color: var(--cyan-glow);">28.6139° N, 77.2090° E</strong></div>
+            </div>
+        </section>
+
+        <!-- CENTER PANEL: Animated Tactical Radar HUD -->
+        <section class="cyber-panel" id="panelRadar">
+            <div class="panel-title">
+                <span>Autonomous Police Drone Radar // Sector 4</span>
+                <span id="badgeDrone" style="color: var(--cyan-glow); font-size: 0.7rem; font-family: 'Orbitron';">DOCKED READY</span>
+            </div>
+
+            <div class="tactical-viewport">
+                <canvas id="radarCanvas"></canvas>
+                <div class="hud-crosshair">
+                    <div>SECTOR: <strong>DELHI-NCR // CELL-402</strong></div>
+                    <div>SURVEILLANCE: <strong>ACTIVE</strong> | FLIGHT: <span id="hudFlightStatus">IDLE</span></div>
+                    <div>TELEMETRY REFRESH: <strong>60 FPS</strong></div>
+                </div>
+            </div>
+
+            <div class="stat-grid">
+                <div class="stat-card">
+                    <div class="stat-label">Cell Tower Station</div>
+                    <div class="stat-value" style="font-size: 0.95rem;">AIRTEL TOWER #402</div>
+                </div>
+                <div class="stat-card danger" id="cardETA">
+                    <div class="stat-label">Flight ETA to Target</div>
+                    <div class="stat-value" id="valETA">0.0 <span style="font-size: 0.75rem;">sec</span></div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Airspeed & Altitude</div>
+                    <div class="stat-value" style="font-size: 0.95rem;" id="valSpeedAlt">0 km/h | 0m AGL</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Deterrence Payload</div>
+                    <div class="stat-value" style="font-size: 0.85rem;" id="valDeterrence">STROBE & SIREN ARMED</div>
+                </div>
+            </div>
+
+            <div class="panel-title" style="margin-top: 4px;">
+                <span>Mission Controls (Anime.js Animated Engine)</span>
+            </div>
+            <div style="display: grid; grid-template-columns: 1.4fr 1fr 1fr; gap: 10px;">
+                <button class="btn-cyber btn-cyber-red" onclick="triggerAmbush()">🚨 AMBUSH & AUTO-DISPATCH</button>
+                <button class="btn-cyber btn-cyber-cyan" onclick="trigger3sButton()">⚡ 3s POWER KEY</button>
+                <button class="btn-cyber btn-cyber-dark" onclick="resetSystem()">🔄 RESET BASELINE</button>
+            </div>
+        </section>
+
+        <!-- RIGHT PANEL: SHA-256 Cryptographic Evidence Vault -->
+        <section class="cyber-panel">
+            <div class="panel-title">
+                <span>Cryptographic Evidence Vault</span>
+                <span style="color: var(--cyan-glow); font-size: 0.7rem; font-family: 'Orbitron';">SHA-256 LEDGER</span>
+            </div>
+            <div style="font-family: 'Share Tech Mono'; font-size: 0.74rem; color: var(--text-dim);">
+                Append-only immutable chain for judicial tamper verification.
+            </div>
+            <div class="cyber-ledger" id="ledgerLogs">
+                <div class="ledger-item">
+                    [GENESIS BLOCK #0] Initialized.<br>
+                    <span class="hash-str">PrevHash: 0000000000000000000000000000000000000000000000000000000000000000</span>
+                </div>
+            </div>
+            <button class="btn-cyber btn-cyber-cyan" onclick="verifyChain()">🔒 AUDIT HASH-CHAIN INTEGRITY</button>
+        </section>
+    </main>
+
+    <footer>
+        <div>SHORTCUTS: <code>[SPACE]</code> Trigger Ambush &nbsp;|&nbsp; <code>[R]</code> Reset &nbsp;|&nbsp; <code>[V]</code> Verify Ledger</div>
+        <div>RAKSHAK CIVIC OS // MODULE 3: ZERO-CLICK AUTONOMOUS DRONE PROTOCOL</div>
+    </footer>
+
+    <!-- Tactical Radar Canvas & Anime.js Script -->
+    <script>
+        // Clock Display
+        setInterval(() => {
+            document.getElementById('clockDisplay').innerText = new Date().toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
+        }, 1000);
+
+        const canvas = document.getElementById('radarCanvas');
+        const ctx = canvas.getContext('2d');
+        const ecgCanvas = document.getElementById('ecgCanvas');
+        const ecgCtx = ecgCanvas.getContext('2d');
+        const audioCanvas = document.getElementById('audioCanvas');
+        const audioCtx = audioCanvas.getContext('2d');
+
+        function resize() {
+            canvas.width = canvas.parentElement.clientWidth;
+            canvas.height = canvas.parentElement.clientHeight;
+            ecgCanvas.width = ecgCanvas.clientWidth;
+            ecgCanvas.height = ecgCanvas.clientHeight;
+            audioCanvas.width = audioCanvas.clientWidth;
+            audioCanvas.height = audioCanvas.clientHeight;
+        }
+        window.addEventListener('resize', resize);
+        resize();
+
+        let state = 'NORMAL'; // 'NORMAL' | 'ATTACK' | 'ARRIVED'
+        let currentIncidentId = 'INC-CYBER-001';
+        let seq = 0;
+        let radarAngle = 0;
+
+        // Coordinates & Entities
+        const tower = { x: 0.18, y: 0.35 };
+        const guy = { x: 0.82, y: 0.68, shockwaveRadius: 0 };
+        const drone = { x: tower.x, y: tower.y, rotorAngle: 0, active: false, strobeFlash: false };
+
+        let ecgPhase = 0;
+        let audioPhase = 0;
+
+        function addLedgerEntry(blockIndex, incidentId, hash, prevHash) {
+            const box = document.getElementById("ledgerLogs");
+            const entry = document.createElement("div");
+            entry.className = "ledger-item";
+            entry.innerHTML = `[BLOCK #${blockIndex}] Incident: ${incidentId}<br>
+                Prev: <span class="hash-str">${prevHash.substring(0, 22)}...</span><br>
+                Hash: <span class="hash-str">${hash.substring(0, 30)}...</span>`;
+            box.appendChild(entry);
+            box.scrollTop = box.scrollHeight;
+
+            // Anime.js entry pop animation
+            anime({
+                targets: entry,
+                translateX: [-20, 0],
+                opacity: [0, 1],
+                duration: 400,
+                easing: 'easeOutExpo'
+            });
+        }
+
+        // ==============================================
+        //  CANVAS TACTICAL HUD DRAW LOOP (60 FPS)
+        // ==============================================
+        function drawRadarHUD() {
+            const w = canvas.width;
+            const h = canvas.height;
+            ctx.clearRect(0, 0, w, h);
+
+            // 1. Futuristic Hex/Grid Pattern
+            ctx.strokeStyle = 'rgba(0, 240, 255, 0.08)';
+            ctx.lineWidth = 1;
+            const step = 35;
+            for (let x = 0; x < w; x += step) {
+                ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+            }
+            for (let y = 0; y < h; y += step) {
+                ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+            }
+
+            // 2. Concentric Radar Rings & Mil-Spec Arcs
+            const cx = tower.x * w;
+            const cy = tower.y * h;
+            [50, 120, 220, 340].forEach((r, idx) => {
+                ctx.beginPath();
+                ctx.arc(cx, cy, r, 0, Math.PI * 2);
+                ctx.strokeStyle = (idx === 1 || idx === 3) ? 'rgba(0, 240, 255, 0.25)' : 'rgba(0, 240, 255, 0.1)';
+                ctx.setLineDash(idx % 2 === 0 ? [2, 6] : []);
+                ctx.stroke();
+                ctx.setLineDash([]);
+
+                ctx.fillStyle = 'rgba(0, 240, 255, 0.4)';
+                ctx.font = '10px "Share Tech Mono"';
+                ctx.fillText(`RNG_${(idx + 1) * 500}M`, cx + r + 4, cy - 4);
+            });
+
+            // 3. Rotating Radar Sweep Beam
+            radarAngle += 0.03;
+            ctx.save();
+            ctx.translate(cx, cy);
+            ctx.rotate(radarAngle);
+            const sweep = ctx.createRadialGradient(0, 0, 0, 0, 0, 340);
+            sweep.addColorStop(0, 'rgba(0, 240, 255, 0.35)');
+            sweep.addColorStop(1, 'rgba(0, 240, 255, 0.0)');
+            ctx.fillStyle = sweep;
+            ctx.beginPath();
+            ctx.moveTo(0, 0);
+            ctx.arc(0, 0, 340, 0, Math.PI / 4);
+            ctx.closePath();
+            ctx.fill();
+            ctx.restore();
+
+            // 4. Cell Tower Dock Node
+            ctx.fillStyle = '#00f0ff';
+            ctx.beginPath(); ctx.arc(cx, cy, 6, 0, Math.PI * 2); ctx.fill();
+            ctx.strokeStyle = 'rgba(0, 240, 255, 0.5)';
+            ctx.lineWidth = 4;
+            ctx.stroke();
+            ctx.font = 'bold 11px "Orbitron"';
+            ctx.fillStyle = '#7dd3fc';
+            ctx.fillText('📡 CELL-DOCK-402', cx - 45, cy - 14);
+
+            // 5. Citizen / Guy (Walking vs Under Threat)
+            const gx = guy.x * w;
+            const gy = guy.y * h;
+
+            if (state === 'NORMAL') {
+                guy.x += (Math.random() - 0.5) * 0.0003;
+                guy.y += (Math.random() - 0.5) * 0.0003;
+                guy.x = Math.max(0.5, Math.min(0.9, guy.x));
+                guy.y = Math.max(0.4, Math.min(0.85, guy.y));
+            } else {
+                // Expanding Threat Shockwave Rings
+                guy.shockwaveRadius = (guy.shockwaveRadius + 0.8) % 40;
+                ctx.beginPath();
+                ctx.arc(gx, gy, guy.shockwaveRadius, 0, Math.PI * 2);
+                ctx.strokeStyle = `rgba(255, 0, 85, ${1 - guy.shockwaveRadius / 40})`;
+                ctx.lineWidth = 2;
+                ctx.stroke();
+            }
+
+            // Citizen Icon
+            ctx.fillStyle = (state === 'NORMAL') ? '#00ff88' : '#ff0055';
+            ctx.beginPath(); ctx.arc(gx, gy, 8, 0, Math.PI * 2); ctx.fill();
+            ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.stroke();
+            ctx.font = 'bold 11px "Orbitron"';
+            ctx.fillStyle = (state === 'NORMAL') ? '#4ade80' : '#ff0055';
+            ctx.fillText((state === 'NORMAL') ? '🚶 CITIZEN (NOMINAL)' : '🚨 VICTIM (STEALTH SOS)', gx - 60, gy + 22);
+
+            // 6. Drone Flight Path & Rendering
+            drone.rotorAngle += 0.5;
+            const dx = drone.x * w;
+            const dy = drone.y * h;
+
+            if (drone.active) {
+                // Flight Trajectory Dashed Line
+                ctx.beginPath();
+                ctx.moveTo(cx, cy);
+                ctx.lineTo(dx, dy);
+                ctx.lineTo(gx, gy);
+                ctx.strokeStyle = 'rgba(0, 240, 255, 0.4)';
+                ctx.lineWidth = 2;
+                ctx.setLineDash([6, 6]);
+                ctx.stroke();
+                ctx.setLineDash([]);
+
+                // Spotlight Cone on Ground
+                ctx.save();
+                const cone = ctx.createRadialGradient(dx, dy, 4, dx, dy, 90);
+                cone.addColorStop(0, 'rgba(0, 240, 255, 0.45)');
+                cone.addColorStop(1, 'rgba(0, 240, 255, 0.0)');
+                ctx.fillStyle = cone;
+                ctx.beginPath(); ctx.arc(dx, dy, 90, 0, Math.PI * 2); ctx.fill();
+                ctx.restore();
+            }
+
+            // Draw Drone Quadcopter Body
+            ctx.save();
+            ctx.translate(dx, dy);
+            
+            // X-Frame Arms
+            ctx.strokeStyle = '#94a3b8';
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.moveTo(-14, -14); ctx.lineTo(14, 14);
+            ctx.moveTo(14, -14); ctx.lineTo(-14, 14);
+            ctx.stroke();
+
+            // 4 Spinning Neon Rotors
+            [ [-14, -14], [14, -14], [-14, 14], [14, 14] ].forEach(([rx, ry]) => {
+                ctx.fillStyle = 'rgba(0, 240, 255, 0.65)';
+                ctx.beginPath(); ctx.arc(rx, ry, 7, 0, Math.PI * 2); ctx.fill();
+                ctx.strokeStyle = '#00f0ff'; ctx.lineWidth = 1.5; ctx.stroke();
+            });
+
+            // Center Fuselage
+            ctx.fillStyle = (state === 'ARRIVED') ? '#ff0055' : '#0284c7';
+            ctx.beginPath(); ctx.arc(0, 0, 7, 0, Math.PI * 2); ctx.fill();
+            ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.stroke();
+
+            // Flashing Police Strobe if Arrived
+            if (state === 'ARRIVED') {
+                drone.strobeFlash = !drone.strobeFlash;
+                if (drone.strobeFlash) {
+                    ctx.fillStyle = 'rgba(255, 0, 85, 0.8)';
+                    ctx.beginPath(); ctx.arc(0, 0, 18, 0, Math.PI * 2); ctx.fill();
+                }
+            }
+
+            ctx.restore();
+
+            ctx.font = 'bold 11px "Orbitron"';
+            ctx.fillStyle = '#38bdf8';
+            ctx.fillText('🚁 DRONE-RAKSHAK-01', dx - 60, dy - 20);
+
+            requestAnimationFrame(drawRadarHUD);
+        }
+
+        // ==============================================
+        //  ECG & AUDIO SPECTROGRAM OSCILLOSCOPES
+        // ==============================================
+        function drawOscilloscopes() {
+            // ECG
+            const ew = ecgCanvas.width;
+            const eh = ecgCanvas.height;
+            ecgCtx.fillStyle = '#020509';
+            ecgCtx.fillRect(0, 0, ew, eh);
+
+            ecgCtx.strokeStyle = (state === 'NORMAL') ? '#00ff88' : '#ff0055';
+            ecgCtx.lineWidth = 2;
+            ecgCtx.beginPath();
+            ecgPhase += (state === 'NORMAL') ? 0.08 : 0.24;
+
+            for (let x = 0; x < ew; x++) {
+                const angle = (x / 18) + ecgPhase;
+                let y = eh / 2;
+                const p = Math.sin(angle);
+                if (p > 0.82) y -= (p - 0.82) * eh * 1.8;
+                else if (p < -0.82) y += eh * 0.45;
+                if (x === 0) ecgCtx.moveTo(x, y);
+                else ecgCtx.lineTo(x, y);
+            }
+            ecgCtx.stroke();
+
+            // Audio Spectrum
+            const aw = audioCanvas.width;
+            const ah = audioCanvas.height;
+            audioCtx.fillStyle = '#020509';
+            audioCtx.fillRect(0, 0, aw, ah);
+
+            audioCtx.strokeStyle = (state === 'NORMAL') ? '#00f0ff' : '#ff0055';
+            audioCtx.lineWidth = 2;
+            audioCtx.beginPath();
+            audioPhase += 0.15;
+
+            const amp = (state === 'NORMAL') ? 5 : 20;
+            for (let x = 0; x < aw; x += 4) {
+                const hVal = Math.sin(x * 0.1 + audioPhase) * amp + (Math.random() * (state === 'NORMAL' ? 3 : 14));
+                audioCtx.moveTo(x, (ah / 2) - hVal);
+                audioCtx.lineTo(x, (ah / 2) + hVal);
+            }
+            audioCtx.stroke();
+
+            requestAnimationFrame(drawOscilloscopes);
+        }
+
+        // ==============================================
+        //  ANIME.JS INTERACTIVE SCENARIOS & ANIMATIONS
+        // ==============================================
+        async function triggerAmbush() {
+            seq++;
+            state = 'ATTACK';
+            currentIncidentId = "INC-" + Math.random().toString(36).substring(2, 8).toUpperCase();
+
+            // Anime.js HUD Alert Flashing
+            anime({
+                targets: '#hudSystemStatus',
+                backgroundColor: ['rgba(0, 240, 255, 0.1)', 'rgba(255, 0, 85, 0.4)', 'rgba(255, 0, 85, 0.2)'],
+                borderColor: ['#00f0ff', '#ff0055'],
+                color: ['#00f0ff', '#ff0055'],
+                duration: 600,
+                easing: 'easeInOutQuad'
+            });
+            document.getElementById('hudSystemStatus').innerText = '🚨 CRITICAL // STEALTH SOS ACTIVE';
+
+            // Anime.js Metric Counter Surge
+            const hrObj = { val: 72 };
+            anime({
+                targets: hrObj,
+                val: 168,
+                round: 1,
+                duration: 1200,
+                easing: 'easeOutExpo',
+                update: () => {
+                    document.getElementById('valHR').innerText = hrObj.val;
+                }
+            });
+
+            const hrvObj = { val: 48.2 };
+            anime({
+                targets: hrvObj,
+                val: 3.2,
+                round: 10,
+                duration: 1200,
+                easing: 'easeOutExpo',
+                update: () => {
+                    document.getElementById('valHRV').innerText = hrvObj.val.toFixed(1);
+                }
+            });
+
+            // Card Alert Themes
+            document.getElementById('cardHR').className = 'stat-card danger';
+            document.getElementById('cardHRV').className = 'stat-card danger';
+            document.getElementById('cardAcoustic').className = 'stat-card danger';
+            document.getElementById('badgeBio').innerText = 'PANIC SURGE';
+            document.getElementById('badgeBio').style.color = 'var(--red-alert)';
+
+            document.getElementById('valAcoustic').innerText = 'HUMAN_SCREAM_PANIC';
+            document.getElementById('badgeAcoustic').innerText = 'SCREAM DETECTED';
+            document.getElementById('badgeAcoustic').style.color = 'var(--red-alert)';
+            document.getElementById('valConf').innerText = '96.8%';
+            document.getElementById('valConf').style.color = 'var(--red-alert)';
+
+            document.getElementById('valScreen').innerText = 'BLACKOUT (STEALTH MODE)';
+            document.getElementById('valScreen').style.color = 'var(--red-alert)';
+            document.getElementById('valUplink').innerText = 'ENCRYPTED MQTT (QoS 2 ACTIVE)';
+            document.getElementById('valUplink').style.color = 'var(--cyan-glow)';
+
+            document.getElementById('lightBio').className = 'pulse-light alert';
+            document.getElementById('lightTinyML').className = 'pulse-light alert';
+            document.getElementById('hudFlightStatus').innerText = 'TRANSIT_TO_TARGET';
+            document.getElementById('badgeDrone').innerText = 'DRONE LAUNCHED';
+            document.getElementById('badgeDrone').style.color = 'var(--amber-warn)';
+
+            // Anime.js Drone Flight Trajectory Animation across Radar
+            drone.active = true;
+            drone.x = tower.x;
+            drone.y = tower.y;
+
+            const etaObj = { eta: 45.0 };
+            anime({
+                targets: etaObj,
+                eta: 0.0,
+                round: 10,
+                duration: 4000,
+                easing: 'linear',
+                update: () => {
+                    document.getElementById('valETA').innerHTML = `${etaObj.eta.toFixed(1)} <span style="font-size:0.75rem;">sec</span>`;
+                    document.getElementById('valSpeedAlt').innerText = `80 km/h | 65m AGL`;
+                }
+            });
+
+            anime({
+                targets: drone,
+                x: guy.x,
+                y: guy.y,
+                duration: 4000,
+                easing: 'easeInOutQuad',
+                complete: () => {
+                    state = 'ARRIVED';
+                    document.getElementById('hudFlightStatus').innerText = 'ON_SCENE_LOITERING';
+                    document.getElementById('badgeDrone').innerText = 'ON SCENE LOITERING';
+                    document.getElementById('badgeDrone').style.color = 'var(--green-active)';
+                    document.getElementById('valSpeedAlt').innerText = `0 km/h | 30m AGL (LOITER)`;
+                    document.getElementById('valDeterrence').innerText = `STROBES ACTIVE // SIREN ON`;
+                }
+            });
+
+            // Post to Server Evidence Vault
+            const payload = {
+                incident_id: currentIncidentId,
+                user_id: "CITIZEN-PRIYA-NCR-771",
+                sequence_number: seq,
+                gps: { latitude: 28.6289, longitude: 77.2065, altitude_m: 12.0 },
+                heart_rate_bpm: 168.0,
+                hrv_rmssd: 3.2,
+                acoustic_category: "HUMAN_SCREAM_PANIC",
+                acoustic_confidence: 0.968,
+                threat_level: "CRITICAL",
+                trigger_type: "ZERO_CLICK_MULTI_FACTOR_DANGER",
+                stealth_mode_active: true,
+                battery_level_pct: 91.0
+            };
+
+            await fetch("/api/v1/sos/trigger", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload)
+            }).then(r => r.json()).then(data => {
+                if(data.block_hash) addLedgerEntry(data.block_index, data.incident_id, data.block_hash, "000000...");
+            });
+        }
+
+        async function trigger3sButton() {
+            triggerAmbush();
+            document.getElementById('hudSystemStatus').innerText = '⚡ 3s HARDWARE BUTTON SOS OVERRIDE';
+        }
+
+        function resetSystem() {
+            state = 'NORMAL';
+            drone.active = false;
+            drone.x = tower.x;
+            drone.y = tower.y;
+
+            document.getElementById('hudSystemStatus').innerText = 'SYSTEM: ARMED & NOMINAL';
+            document.getElementById('hudSystemStatus').style.color = 'var(--cyan-glow)';
+            document.getElementById('hudSystemStatus').style.borderColor = 'var(--cyan-glow)';
+            document.getElementById('hudSystemStatus').style.background = 'rgba(0, 240, 255, 0.1)';
+
+            document.getElementById('valHR').innerText = '72';
+            document.getElementById('valHRV').innerText = '48.2';
+            document.getElementById('cardHR').className = 'stat-card';
+            document.getElementById('cardHRV').className = 'stat-card';
+            document.getElementById('cardAcoustic').className = 'stat-card';
+
+            document.getElementById('badgeBio').innerText = 'NORMAL';
+            document.getElementById('badgeBio').style.color = 'var(--green-active)';
+
+            document.getElementById('valAcoustic').innerText = 'AMBIENT_NORMAL';
+            document.getElementById('badgeAcoustic').innerText = 'LISTENING';
+            document.getElementById('badgeAcoustic').style.color = 'var(--cyan-glow)';
+            document.getElementById('valConf').innerText = '94.8%';
+            document.getElementById('valConf').style.color = 'var(--green-active)';
+
+            document.getElementById('valScreen').innerText = 'NORMAL UNLOCKED';
+            document.getElementById('valScreen').style.color = 'var(--green-active)';
+            document.getElementById('valUplink').innerText = 'STANDBY (0 B/s)';
+            document.getElementById('valUplink').style.color = 'var(--text-dim)';
+
+            document.getElementById('lightBio').className = 'pulse-light';
+            document.getElementById('lightTinyML').className = 'pulse-light';
+
+            document.getElementById('hudFlightStatus').innerText = 'IDLE';
+            document.getElementById('badgeDrone').innerText = 'DOCKED READY';
+            document.getElementById('badgeDrone').style.color = 'var(--cyan-glow)';
+            document.getElementById('valETA').innerHTML = `0.0 <span style="font-size:0.75rem;">sec</span>`;
+            document.getElementById('valSpeedAlt').innerText = `0 km/h | 0m AGL`;
+            document.getElementById('valDeterrence').innerText = `STROBE & SIREN ARMED`;
+        }
+
+        async function verifyChain() {
+            if(!currentIncidentId) { alert("No incident selected."); return; }
+            const res = await fetch(`/api/v1/incidents/${currentIncidentId}/evidence-ledger`).then(r => r.json());
+            alert(`🔒 Cryptographic Verification Audit Report:
+• Hash Chain Valid: ${res.chain_integrity_valid}
+• Total Blocks Verified: ${res.block_count}
+• Audit Message: ${res.audit_report}`);
+        }
+
+        // Keyboard Shortcuts: Space to trigger, R to reset, V to verify
+        window.addEventListener('keydown', (e) => {
+            if (e.code === 'Space') {
+                e.preventDefault();
+                triggerAmbush();
+            } else if (e.key === 'r' || e.key === 'R') {
+                resetSystem();
+            } else if (e.key === 'v' || e.key === 'V') {
+                verifyChain();
+            }
+        });
+
+        // Start loops
+        drawRadarHUD();
+        drawOscilloscopes();
+    </script>
+</body>
+</html>
+"""
+
+
+@app.get("/", response_class=HTMLResponse)
+def serve_dashboard():
+    base_dir = Path(__file__).resolve().parent.parent
+    template_path = base_dir / "templates" / "index.html"
+    if template_path.exists():
+        try:
+            with open(template_path, "r", encoding="utf-8") as f:
+                return f.read()
+        except Exception:
+            pass
+    return EMBEDDED_HTML_DASHBOARD

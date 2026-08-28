@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  rakshak-server:
+    build: .
+    container_name: rakshak_protocol_eoc
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      - RAKSHAK_SECRET_KEY=rakshak-shared-secret-key-2026
+      - MQTT_HOST=mosquitto
+      - MQTT_PORT=1883
+    depends_on:
+      - mosquitto
+    networks:
+      - rakshak-net
+
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: rakshak_mqtt_broker
+    restart: always
+    ports:
+      - "1883:1883"
+    networks:
+      - rakshak-net
+
+networks:
+  rakshak-net:
+    driver: bridge
